@@ -65,10 +65,41 @@ def detect_gpus() -> list[dict]:
     return gpus
 
 
+def _resolve_text_config(hf_config: dict) -> dict:
+    """
+    Extract the text/language model config from an HF config.json.
+
+    For plain language models (GPT, Llama, Qwen2.5, etc.) the keys live at
+    the top level.  For conditional-generation / multimodal models (Qwen3.5,
+    LLaVA, etc.) the language-model keys are nested under 'text_config'.
+    """
+    if "text_config" in hf_config:
+        return hf_config["text_config"]
+    return hf_config
+
+
+def _count_attention_layers(text_cfg: dict) -> int | None:
+    """
+    For hybrid architectures (e.g. Qwen3.5 DeltaNet + Attention) return the
+    number of layers that actually use standard attention (and therefore
+    allocate KV cache).  Returns None for dense models where every layer has
+    attention.
+    """
+    # Qwen3.5 uses 'layer_types' — a list like ["full_attention",
+    # "linear_attention", ...].  Only "full_attention" layers have KV cache.
+    layer_types = text_cfg.get("layer_types")
+    if layer_types is not None:
+        return sum(1 for t in layer_types if t == "full_attention")
+    return None
+
+
 def resolve_model_params(config: dict) -> tuple[float, int, int]:
     """
-    Return (total_params_billion, num_hidden_layers, num_kv_heads, head_dim)
+    Return (total_params_billion, num_kv_layers, num_kv_heads, head_dim)
     by reading the HF model config.json.
+
+    num_kv_layers is the number of layers that contribute KV cache — for
+    hybrid models this is fewer than total layers.
 
     Falls back to active_params_billion from user config if set.
     """
@@ -76,29 +107,34 @@ def resolve_model_params(config: dict) -> tuple[float, int, int]:
 
     # Try to read config.json from HF cache or local path
     hf_config = _load_hf_config(model_name)
+    text_cfg = _resolve_text_config(hf_config)
 
     total_params_b = config["model"].get("active_params_billion")
-    num_layers = hf_config.get("num_hidden_layers", 0)
-    num_kv_heads = hf_config.get("num_key_value_heads") or hf_config.get("num_attention_heads", 0)
-    head_dim = hf_config.get("head_dim") or (
-        hf_config.get("hidden_size", 0) // hf_config.get("num_attention_heads", 1)
+    num_total_layers = text_cfg.get("num_hidden_layers", 0)
+    num_kv_heads = text_cfg.get("num_key_value_heads") or text_cfg.get("num_attention_heads", 0)
+    head_dim = text_cfg.get("head_dim") or (
+        text_cfg.get("hidden_size", 0) // text_cfg.get("num_attention_heads", 1)
     )
+
+    # For hybrid architectures, only attention layers have KV cache
+    num_attn_layers = _count_attention_layers(text_cfg)
+    num_kv_layers = num_attn_layers if num_attn_layers is not None else num_total_layers
 
     if total_params_b is None:
         # Estimate from HF config: very rough but serviceable
         # Better: user should set active_params_billion explicitly
-        hidden = hf_config.get("hidden_size", 0)
-        intermediate = hf_config.get("intermediate_size", 0)
-        vocab = hf_config.get("vocab_size", 0)
+        hidden = text_cfg.get("hidden_size", 0)
+        intermediate = text_cfg.get("intermediate_size", 0)
+        vocab = text_cfg.get("vocab_size", 0) or hf_config.get("vocab_size", 0)
         # Rough param estimate: embedding + transformer blocks
-        est_params = vocab * hidden + num_layers * (
+        est_params = vocab * hidden + num_total_layers * (
             4 * hidden * hidden  # attn projections (approx)
             + 2 * hidden * intermediate  # FFN up/down
         )
         total_params_b = est_params / 1e9
         print(f"  Auto-estimated model params: {total_params_b:.1f}B")
 
-    return total_params_b, num_layers, num_kv_heads, head_dim
+    return total_params_b, num_kv_layers, num_kv_heads, head_dim
 
 
 def _load_hf_config(model_name: str) -> dict:
@@ -141,10 +177,15 @@ def _load_hf_config(model_name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def estimate_model_weight_vram_gib(total_params_b: float, quant: str) -> float:
-    """Estimate VRAM for model weights in GiB."""
+    """Estimate VRAM for model weights in GiB.
+
+    Applies a 1.25x overhead factor to account for CUDA graphs, activation
+    memory, framework buffers, and inaccuracies in auto-estimated param counts.
+    """
     bytes_per_param = QUANT_BYTES.get(quant, 2.0)
     total_bytes = total_params_b * 1e9 * bytes_per_param
-    return total_bytes / BYTES_PER_GIB
+    OVERHEAD_FACTOR = 1.25
+    return (total_bytes / BYTES_PER_GIB) * OVERHEAD_FACTOR
 
 
 def estimate_kv_cache_vram_gib(
@@ -212,9 +253,9 @@ def main():
 
     # Model params
     quant = config["model"].get("quantization", "none")
-    total_params_b, num_layers, num_kv_heads, head_dim = resolve_model_params(config)
+    total_params_b, num_kv_layers, num_kv_heads, head_dim = resolve_model_params(config)
 
-    if num_layers == 0 or num_kv_heads == 0:
+    if num_kv_layers == 0 or num_kv_heads == 0:
         print("\n  WARNING: Could not determine model architecture details.")
         print("  Skipping KV cache estimation — relying on vLLM's own checks.\n")
         return
@@ -225,14 +266,23 @@ def main():
     # KV cache VRAM
     max_ctx = config["serving"]["max_context_length"]
     max_seqs = config["serving"]["max_num_seqs"]
-    kv_vram = estimate_kv_cache_vram_gib(num_layers, num_kv_heads, head_dim, max_ctx, max_seqs)
+    kv_vram = estimate_kv_cache_vram_gib(num_kv_layers, num_kv_heads, head_dim, max_ctx, max_seqs)
 
     total_required = weight_vram + kv_vram
+
+    # Check if this is a hybrid architecture
+    hf_config = _load_hf_config(config["model"]["name"])
+    text_cfg = _resolve_text_config(hf_config)
+    num_total_layers = text_cfg.get("num_hidden_layers", num_kv_layers)
+    is_hybrid = num_kv_layers < num_total_layers
 
     print(f"\n  Model               : {config['model']['name']}")
     print(f"  Quantization        : {quant}")
     print(f"  Active params       : {total_params_b:.1f}B")
-    print(f"  Layers              : {num_layers}")
+    if is_hybrid:
+        print(f"  Layers              : {num_total_layers} ({num_kv_layers} attention, {num_total_layers - num_kv_layers} DeltaNet)")
+    else:
+        print(f"  Layers              : {num_total_layers}")
     print(f"  KV heads            : {num_kv_heads}")
     print(f"  Head dim            : {head_dim}")
     print(f"  Context length      : {max_ctx:,}")

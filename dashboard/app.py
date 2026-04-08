@@ -13,11 +13,28 @@ import os
 import subprocess
 import time
 
+import yaml
 from flask import Flask, jsonify, Response
 
 app = Flask(__name__)
 
 VLLM_INTERNAL_URL = os.environ.get("VLLM_URL", "http://vllm:8000")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _load_config() -> dict:
+    try:
+        with open("/workspace/config.yaml") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+_CONFIG = _load_config()
+VLLM_API_KEY = _CONFIG.get("serving", {}).get("api_key", "") or ""
+VLLM_MODEL = _CONFIG.get("model", {}).get("name", "")
+VLLM_PORT = _CONFIG.get("serving", {}).get("port", 7171)
 
 # ---------------------------------------------------------------------------
 # Data collectors
@@ -146,6 +163,8 @@ def vllm_models() -> list[dict]:
     import urllib.request
     try:
         req = urllib.request.Request(f"{VLLM_INTERNAL_URL}/v1/models", method="GET")
+        if VLLM_API_KEY:
+            req.add_header("Authorization", f"Bearer {VLLM_API_KEY}")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
         return data.get("data", [])
@@ -161,11 +180,26 @@ def _safe_float(s: str) -> float | None:
 
 
 LOG_FILE = "/var/log/sandboxllm/vllm.log"
+LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB — truncate to last 5 MB when exceeded
 
 
 def read_logs(tail: int = 200) -> str:
     """Read the last N lines from the shared vLLM log file."""
     try:
+        # Truncate if log file is too large (keep last half)
+        try:
+            size = os.path.getsize(LOG_FILE)
+            if size > LOG_MAX_BYTES:
+                with open(LOG_FILE, "r+") as f:
+                    f.seek(size - LOG_MAX_BYTES // 2)
+                    f.readline()  # skip partial line
+                    keep = f.read()
+                    f.seek(0)
+                    f.write(keep)
+                    f.truncate()
+        except (OSError, IOError):
+            pass
+
         with open(LOG_FILE, "r") as f:
             lines = f.readlines()
         return "".join(lines[-tail:])
@@ -189,6 +223,16 @@ def api_stats():
         "cpu_temp_c": cpu_temp(),
         "ram": ram_stats(),
         "served_models": vllm_models(),
+    })
+
+
+@app.route("/api/connection")
+def api_connection():
+    """Return connection details for Cline / API clients."""
+    return jsonify({
+        "model": VLLM_MODEL,
+        "port": VLLM_PORT,
+        "has_api_key": bool(VLLM_API_KEY),
     })
 
 
@@ -274,6 +318,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .log-pre .log-header-line { color: var(--accent); font-weight: 600; }
   .log-pre .log-dim { color: var(--muted); }
 
+  /* ---- Connect tab ---- */
+  .connect-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 16px; }
+  .setting-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-label { font-size: 0.85rem; color: var(--muted); flex-shrink: 0; margin-right: 16px; }
+  .setting-value { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.9rem; color: var(--text);
+                   background: #0a0c10; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+                   user-select: all; word-break: break-all; }
+  .setting-value.secret { filter: blur(4px); transition: filter 0.2s; cursor: pointer; }
+  .setting-value.secret:hover, .setting-value.secret.revealed { filter: none; }
+  .connect-hint { font-size: 0.8rem; color: var(--muted); margin-top: 12px; line-height: 1.5; }
+
   .footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 24px; }
   #error-banner { display: none; background: rgba(248,113,113,0.15); color: var(--red); padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.85rem; }
 </style>
@@ -288,6 +344,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="tabs">
   <div class="tab active" data-tab="monitoring">Monitoring</div>
   <div class="tab" data-tab="logs">Logs</div>
+  <div class="tab" data-tab="connect">Connect</div>
 </div>
 
 <!-- Monitoring tab -->
@@ -322,6 +379,38 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <pre class="log-pre" id="log-output">Loading...</pre>
+  </div>
+</div>
+
+<!-- Connect tab -->
+<div class="tab-content" id="tab-connect">
+  <div class="connect-grid">
+    <div class="card">
+      <h2>Cline Settings</h2>
+      <p class="connect-hint" style="margin-bottom:14px">Copy these into Cline &gt; Settings (gear icon) &gt; API Provider: <strong>OpenAI Compatible</strong></p>
+      <div class="setting-row">
+        <span class="setting-label">API Provider</span>
+        <span class="setting-value">OpenAI Compatible</span>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Base URL</span>
+        <span class="setting-value" id="conn-base-url">--</span>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">API Key</span>
+        <span class="setting-value secret" id="conn-api-key" title="Hover to reveal, click to keep visible">--</span>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Model ID</span>
+        <span class="setting-value" id="conn-model-id">--</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Quick Test</h2>
+      <p class="connect-hint" style="margin-bottom:14px">Run this from your other PC to verify connectivity:</p>
+      <pre class="log-pre" id="conn-curl-cmd" style="max-height:none;font-size:0.8rem;">Loading...</pre>
+      <p class="connect-hint" style="margin-top:14px">If you get a JSON response listing the model, the connection is working.</p>
+    </div>
   </div>
 </div>
 
@@ -464,9 +553,39 @@ async function refreshLogs() {
   }
 }
 
+/* ---- Connection info ---- */
+document.querySelectorAll('.setting-value.secret').forEach(el => {
+  el.addEventListener('click', () => el.classList.toggle('revealed'));
+});
+
+async function refreshConnection() {
+  try {
+    const resp = await fetch('/api/connection');
+    if (!resp.ok) return;
+    const d = await resp.json();
+    const host = window.location.hostname;
+    const port = d.port || 7171;
+    const baseUrl = `http://${host}:${port}/v1`;
+    document.getElementById('conn-base-url').textContent = baseUrl;
+    document.getElementById('conn-model-id').textContent = d.model || '--';
+    const keyEl = document.getElementById('conn-api-key');
+    if (d.has_api_key) {
+      keyEl.textContent = '(set in config.yaml)';
+      keyEl.classList.remove('secret');
+    } else {
+      keyEl.textContent = '(none — no auth required)';
+      keyEl.classList.remove('secret');
+    }
+
+    let curl = `curl ${d.has_api_key ? `-H "Authorization: Bearer YOUR_API_KEY" ` : ''}${baseUrl}/models`;
+    document.getElementById('conn-curl-cmd').textContent = curl;
+  } catch(e) {}
+}
+
 /* ---- Polling ---- */
 refreshStats();
 refreshLogs();
+refreshConnection();
 setInterval(refreshStats, 2000);
 setInterval(refreshLogs, 3000);
 </script>

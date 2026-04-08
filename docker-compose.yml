@@ -40,14 +40,6 @@ services:
 
     # ---------- Security hardening ----------
 
-    # Read-only root filesystem — nothing can be written to the container image.
-    read_only: true
-
-    # tmpfs mounts for the few directories that need writes at runtime.
-    tmpfs:
-      - /tmp:size=2G,noexec,nosuid,nodev
-      - /run:size=64M,noexec,nosuid,nodev
-
     # Drop ALL Linux capabilities, then add back only what's needed.
     cap_drop:
       - ALL
@@ -55,9 +47,6 @@ services:
     # No new privileges (prevents setuid/setgid escalation).
     security_opt:
       - no-new-privileges:true
-
-    # Non-default seccomp profile would go here if you have one:
-    # - seccomp=seccomp-profile.json
 
     # Prevent the container from gaining any additional privileges.
     privileged: false
@@ -81,7 +70,6 @@ services:
 
     # ---------- Environment ----------
     environment:
-      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
       # HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE are set by the entrypoint
       # AFTER the model download phase — not here, so first-run download works.
       - HF_HOME=/root/.cache/huggingface
@@ -119,15 +107,13 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - vllm-logs:/var/log/sandboxllm:ro
+      - ./config.yaml:/workspace/config.yaml:ro
 
     environment:
       - VLLM_URL=http://vllm:7171
       - DASHBOARD_PORT=7172
 
-    # Security: same hardening as vllm (minus the GPU-specific shm)
-    read_only: true
-    tmpfs:
-      - /tmp:size=64M,noexec,nosuid,nodev
+    # Security hardening
     cap_drop:
       - ALL
     security_opt:

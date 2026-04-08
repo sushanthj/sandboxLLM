@@ -94,12 +94,12 @@ gpu:
 
 ```yaml
 model:
-  name: "Qwen/Qwen3.5-9B"
-  quantization: fp8
+  name: "Qwen/Qwen3.5-4B"
+  quantization: none
   active_params_billion: null
 
 serving:
-  max_context_length: 32768
+  max_context_length: 24576
   max_num_seqs: 2
   port: 7171
   api_key: ""
@@ -166,13 +166,14 @@ Not every model is equally suited for agentic coding. Cline relies heavily on **
 
 ### How to read the VRAM tables
 
-Every entry shows three numbers:
+Every entry shows four numbers:
 
-- **Model Weights** — the raw size of all model parameters in VRAM. For MoE models, *all* experts must be loaded even though only a few are active per token.
+- **Weights** — the raw size of all model parameters in VRAM. For MoE models, *all* experts must be loaded even though only a few are active per token. For multimodal models (Qwen3.5), this includes the vision encoder.
+- **Overhead†** — VRAM consumed by CUDA graphs, torch.compile kernels, activation buffers, and encoder cache. This is **not** a rounding error — it is a major cost. Multimodal/hybrid models (Qwen3.5) need ~3.5–4 GiB due to their vision encoder and DeltaNet kernel compilation. Text-only dense models need ~2 GiB. These estimates are based on observed vLLM behavior (see note below).
 - **KV Cache** — the memory reserved for key/value attention cache at the given context length and concurrency. Formula: `2 × attn_layers × kv_heads × head_dim × 2 bytes × context_len × max_num_seqs`. For hybrid models (Qwen3.5) that mix DeltaNet with standard attention, only the attention layers contribute KV cache — a significant saving.
-- **Total** — weights + KV cache. This must fit within `per_gpu_vram × num_gpus × max_utilization`.
+- **Total** — weights + overhead + KV cache. This must fit within `per_gpu_vram × num_gpus × max_utilization`.
 
-> All estimates assume fp16 KV cache (vLLM default). Actual usage includes ~1–2 GiB overhead for activations and CUDA kernels — the preflight script accounts for this via the utilization headroom.
+> **Why overhead matters:** On an RTX 5080 (16 GB), vLLM loading Qwen3.5-4B consumed 8.6 GiB for model weights but **12.6 GiB total** before any KV cache — 4 GiB of pure runtime overhead. The old estimates that ignored this led to OOM crashes. Both machines run a GUI desktop (~1–2 GiB GPU VRAM), but the 85% utilization cap already covers that. All estimates assume fp16 KV cache (vLLM default).
 
 ### Model generations at a glance
 
@@ -188,65 +189,60 @@ Every entry shows three numbers:
 
 ### Setup A: 2x 48 GB GPUs (96 GB total, 85% = 81.6 GiB budget)
 
-These configurations are designed for a dual-GPU workstation (e.g. 2x RTX A6000, 2x L40S, 2x RTX 6000 Ada).
+These configurations are designed for a dual-GPU workstation (e.g. 2x RTX A6000, 2x L40S, 2x RTX 6000 Ada). GUI desktop on one GPU uses ~1–2 GiB, well within the 15% utilization headroom.
 
-| Model | Quant | Total Params | Weights | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
+| Model | Quant | Weights | Overhead† | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
 |---|---|---|---|---|---|---|---|---|---|
-| **`Qwen/Qwen3-Coder-30B-A3B-Instruct`** | fp16 | 30.5B (3.3B active) | 56.8 GiB | 32k | 4 | 12.0 GiB | **68.8 GiB** | Excellent | **Yes** (12.8 GiB headroom) |
-| `Qwen/Qwen3-Coder-30B-A3B-Instruct` | fp16 | 30.5B | 56.8 GiB | 32k | 8 | 24.0 GiB | **80.8 GiB** | Excellent | **Yes** (0.8 GiB headroom) |
-| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | 4-bit | 109B (17B active) | 54.5 GiB | 32k | 2 | 20.0 GiB | **74.5 GiB** | Excellent | **Yes** (7.1 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 32.5B | 60.5 GiB | 32k | 4 | 16.0 GiB | **76.5 GiB** | Good | **Yes** (5.1 GiB headroom) |
-| `Qwen/Qwen3.5-27B` | fp16 | 27B | 50.3 GiB | 32k | 4 | 8.0 GiB | **58.3 GiB** | Very Good | **Yes** (23.3 GiB headroom) |
-| `Qwen/Qwen3.5-27B` | fp16 | 27B | 50.3 GiB | 32k | 12 | 24.0 GiB | **74.3 GiB** | Very Good | **Yes** (7.3 GiB headroom) |
+| **`Qwen/Qwen3-Coder-30B-A3B-Instruct`** | fp16 | 56.8 GiB | ~4 GiB | 32k | 4 | 12.0 GiB | **~73 GiB** | Excellent | **Yes** (8.6 GiB headroom) |
+| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | 4-bit | 54.5 GiB | ~4 GiB | 32k | 2 | 20.0 GiB | **~79 GiB** | Excellent | **Tight** (2.6 GiB headroom) |
+| `Qwen/Qwen3.5-27B` | fp16 | 50.3 GiB | ~5 GiB | 32k | 4 | 8.0 GiB | **~63 GiB** | Very Good | **Yes** (18.6 GiB headroom) |
+| `Qwen/Qwen3.5-27B` | fp16 | 50.3 GiB | ~5 GiB | 32k | 8 | 16.0 GiB | **~71 GiB** | Very Good | **Yes** (10.6 GiB headroom) |
+| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 60.5 GiB | ~3 GiB | 32k | 2 | 16.0 GiB | **~80 GiB** | Good | **Tight** (1.6 GiB headroom) |
 
 > **Architecture details used:**
 > - Qwen3-Coder-30B-A3B: 48 layers, 4 KV heads, head_dim 128, MoE (128 experts, 8 active)
 > - Llama 4 Scout: 80 layers, 8 KV heads, head_dim 128, MoE (16 experts, 2 active). 4-bit via `RedHatAI/Llama-4-Scout-17B-16E-Instruct-quantized.w4a16` or on-the-fly quantization.
-> - Qwen2.5-Coder-32B: 64 layers, 8 KV heads, head_dim 128, dense
-> - Qwen3.5-27B: 64 total layers but only 16 attention layers (hybrid DeltaNet), 4 KV heads, head_dim 256
+> - Qwen2.5-Coder-32B: 64 layers, 8 KV heads, head_dim 128, dense. **Note:** 8 KV heads across 64 layers makes KV cache very expensive — 16 GiB at just 2 concurrent seqs. At 4 seqs (32 GiB KV) it exceeds the budget.
+> - Qwen3.5-27B: 64 total layers but only 16 attention layers (hybrid DeltaNet), 4 KV heads, head_dim 256. Multimodal (vision encoder adds ~1–2 GiB to weights and ~1 GiB to overhead).
 
-**Recommended: Qwen3-Coder-30B-A3B** — purpose-built for agentic coding (Cline, Claude Code). Best tool calling of any open model. 12.8 GiB headroom at 32k. Set `tool_call_parser: "qwen3_coder"`.
+**Recommended: Qwen3-Coder-30B-A3B** — purpose-built for agentic coding (Cline, Claude Code). Best tool calling of any open model. 8.6 GiB headroom at 32k/4 seqs. Set `tool_call_parser: "qwen3_coder"`.
 
-**Meta alternative: Llama 4 Scout (4-bit)** — Meta's flagship open model. Excellent tool calling with parallel tool call support. 109B total params (17B active MoE) squeezed into 96 GB via 4-bit quantization. Limited to 2 concurrent seqs at 32k due to heavy KV cache (80 dense attention layers). Set `tool_call_parser: "llama4_pythonic"`.
+**High-concurrency: Qwen3.5-27B** — hybrid architecture gives it the smallest KV cache in this table. You can run 8 concurrent seqs at 32k and still have 10.6 GiB headroom. Great for multi-user or parallel Cline sessions. Set `tool_call_parser: "hermes"`.
 
-**High-concurrency: Qwen3.5-27B** — hybrid architecture gives it the smallest KV cache in this table. You can run 12 concurrent seqs at 32k and still fit. Great for multi-user or parallel Cline sessions. Set `tool_call_parser: "hermes"`.
+**Meta alternative: Llama 4 Scout (4-bit)** — Meta's flagship open model. Excellent tool calling with parallel tool call support. Fits but tight (2.6 GiB headroom) — limited to 2 concurrent seqs at 32k due to heavy KV cache (80 dense attention layers). Set `tool_call_parser: "llama4_pythonic"`.
 
-**Proven fallback: Qwen2.5-Coder-32B** — battle-tested with Cline, dense architecture (simplest to deploy), but tighter on VRAM. Set `tool_call_parser: "hermes"`.
+**Proven fallback: Qwen2.5-Coder-32B** — battle-tested with Cline, dense architecture (simplest to deploy). Very tight on VRAM — must be limited to 2 concurrent seqs (KV doubles to 32 GiB at 4 seqs, exceeding budget). Set `tool_call_parser: "hermes"`.
 
 ---
 
-### Setup B: 1x 16 GB GPU (RTX 5080, 85% = 13.6 GiB budget)
+### Setup B: 1x 16 GB GPU (RTX 5080, 85% = 13.5 GiB budget)
 
-For testing at home on a single consumer GPU. The Qwen3.5 hybrid architecture shines here — tiny KV cache means you can run a surprisingly capable 9B model in fp8, or a 4B model in full fp16, with 32k context.
+For testing at home on a single consumer GPU. GUI desktop uses ~1–2 GiB of GPU VRAM, covered by the 15% utilization headroom. **Runtime overhead is the dominant constraint here** — multimodal Qwen3.5 models consume ~3.5–4 GiB of overhead (vision encoder cache, hybrid kernel compilation), leaving little room for weights and KV cache. AWQ-quantized text-only models are the sweet spot for 16 GB.
 
-| Model | Quant | Total Params | Weights | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
+| Model | Quant | Weights | Overhead† | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
 |---|---|---|---|---|---|---|---|---|---|
-| **`Qwen/Qwen3.5-9B`** | fp8 | 9B | 8.4 GiB | 32k | 2 | 2.0 GiB | **10.4 GiB** | Very Good | **Yes** (3.2 GiB headroom) |
-| `Qwen/Qwen3.5-4B` | fp16 | 4B | 7.5 GiB | 32k | 2 | 2.0 GiB | **9.5 GiB** | Fair | **Yes** (4.1 GiB headroom) |
-| `Qwen/Qwen3.5-4B` | fp16 | 4B | 7.5 GiB | 32k | 4 | 4.0 GiB | **11.5 GiB** | Fair | **Yes** (2.1 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | awq | 7.6B | 3.5 GiB | 32k | 2 | 3.5 GiB | **7.0 GiB** | Good | **Yes** (6.6 GiB headroom) |
-| `meta-llama/Llama-3.1-8B-Instruct-AWQ` | awq | 8B | 3.7 GiB | 16k | 2 | 4.0 GiB | **7.7 GiB** | Good | **Yes** (5.9 GiB headroom) |
-| `meta-llama/Llama-3.1-8B-Instruct-AWQ` | awq | 8B | 3.7 GiB | 32k | 2 | 8.0 GiB | **11.7 GiB** | Good | **Yes** (1.9 GiB headroom) |
-| `meta-llama/Llama-3.2-3B-Instruct` | fp16 | 3.2B | 6.0 GiB | 16k | 2 | 3.5 GiB | **9.5 GiB** | Fair | **Yes** (4.1 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-1.5B-Instruct` | fp16 | 1.5B | 2.9 GiB | 32k | 4 | 1.8 GiB | **4.7 GiB** | Smoke test | **Yes** (8.9 GiB headroom) |
+| **`Qwen/Qwen2.5-Coder-7B-Instruct-AWQ`** | awq | 3.5 GiB | ~2 GiB | 32k | 2 | 3.5 GiB | **~9.0 GiB** | Good | **Yes** (4.5 GiB headroom) |
+| `meta-llama/Llama-3.1-8B-Instruct-AWQ` | awq | 3.7 GiB | ~2 GiB | 16k | 2 | 4.0 GiB | **~9.7 GiB** | Good | **Yes** (3.8 GiB headroom) |
+| `Qwen/Qwen3.5-4B` | fp16 | 8.6 GiB | ~3.5 GiB | 16k | 2 | 1.0 GiB | **~13.1 GiB** | Fair | **Tight** (0.4 GiB headroom) |
+| `meta-llama/Llama-3.2-3B-Instruct` | fp16 | 6.0 GiB | ~2 GiB | 16k | 2 | 3.5 GiB | **~11.5 GiB** | Fair | **Yes** (2.0 GiB headroom) |
+| `Qwen/Qwen2.5-Coder-1.5B-Instruct` | fp16 | 2.9 GiB | ~1.5 GiB | 32k | 4 | 1.8 GiB | **~6.2 GiB** | Smoke test | **Yes** (7.3 GiB headroom) |
 
 > **Architecture details used:**
-> - Qwen3.5-9B: 32 total layers, **8 attention layers** (hybrid DeltaNet), 4 KV heads, head_dim 256
-> - Qwen3.5-4B: 32 total layers, **8 attention layers** (hybrid DeltaNet), 4 KV heads, head_dim 256
-> - Qwen2.5-Coder-7B: 28 layers (all attention), 4 KV heads, head_dim 128
-> - Llama 3.1-8B: 32 layers (all attention), 8 KV heads, head_dim 128. Note: heavy KV cache (8 KV heads, all layers)
+> - Qwen2.5-Coder-7B: 28 layers (all attention), 4 KV heads, head_dim 128. Text-only — low overhead.
+> - Llama 3.1-8B: 32 layers (all attention), 8 KV heads, head_dim 128. Heavy KV cache (8 KV heads, all layers) — must use 16k context. At 32k the KV alone is 8.0 GiB, which exceeds the budget with overhead.
+> - Qwen3.5-4B: 32 total layers, **8 attention layers** (hybrid DeltaNet), 4 KV heads, head_dim 256. Multimodal — the vision encoder and hybrid kernel compilation add ~3.5 GiB overhead. Observed 8.6 GiB weight VRAM + 4.0 GiB overhead = 12.6 GiB before any KV cache.
 > - Llama 3.2-3B: 28 layers (all attention), 8 KV heads, head_dim 128. Same KV head count as the 8B!
 > - Qwen2.5-Coder-1.5B: 28 layers (all attention), 2 KV heads, head_dim 64
+>
+> **Not listed: Qwen3.5-9B (fp8)** — despite low KV cache (2.0 GiB), the weight VRAM (~9.5 GiB) plus multimodal overhead (~3.5 GiB) totals ~13 GiB *before* any KV allocation. Does not fit on 16 GB.
 
-Notice the KV cache differences: Qwen3.5 models use only **2.0 GiB** at 32k context (8 attention layers out of 32), while the similarly-sized Llama 3.1-8B needs **8.0 GiB** (all 32 layers, 8 KV heads). The hybrid DeltaNet architecture is a game-changer for VRAM-constrained setups.
+**Recommended: Qwen2.5-Coder-7B-AWQ** — dedicated coding model, proven with Cline, and the best fit for 16 GB. AWQ quantization keeps weights at just 3.5 GiB, and as a text-only model it has low runtime overhead (~2 GiB). Full 32k context with 4.5 GiB to spare. Set `tool_call_parser: "hermes"`.
 
-**Recommended: Qwen3.5-9B (fp8)** — latest generation, 9B params with only 2 GiB KV cache at 32k. The 9B model punches above many prior 13–30B models on reasoning/coding benchmarks. Officially optimized for Cline. Set `tool_call_parser: "hermes"`.
+**Meta alternative: Llama 3.1-8B-Instruct-AWQ** — solid tool calling and proven general-purpose model. Must use 16k context — the dense architecture with 8 KV heads makes 32k context too expensive (8 GiB KV alone). Set `tool_call_parser: "llama3_json"`.
 
-**Meta alternative: Llama 3.1-8B-Instruct-AWQ** — Meta's best option for 16 GB. Solid tool calling and 128k native context. However, the dense architecture with 8 KV heads means KV cache is expensive — use 16k context to keep headroom. Set `tool_call_parser: "llama3_json"`.
+**Latest gen (tight): Qwen3.5-4B** — hybrid DeltaNet architecture with efficient KV cache, but the multimodal overhead leaves only 0.4 GiB headroom at 16k context. Not recommended unless you need vision capabilities. Set `tool_call_parser: "hermes"`.
 
-**Coding-specific: Qwen2.5-Coder-7B-AWQ** — dedicated coding model, proven with Cline. Smallest total footprint (7.0 GiB) thanks to aggressive AWQ quantization. Set `tool_call_parser: "hermes"`.
-
-**Smoke test: Qwen2.5-Coder-1.5B** — loads in under 5 GiB. Too small for real agentic work, but validates Docker, networking, and Cline connectivity end-to-end.
+**Smoke test: Qwen2.5-Coder-1.5B** — loads in under 7 GiB. Too small for real agentic work, but validates Docker, networking, and Cline connectivity end-to-end.
 
 ---
 
@@ -255,11 +251,10 @@ Notice the KV cache differences: Qwen3.5 models use only **2.0 GiB** at 32k cont
 | Your hardware | Best model | Tool parser | Agentic | Why |
 |---|---|---|---|---|
 | 2x 48 GB GPUs (work) | Qwen3-Coder-30B-A3B fp16, TP=2 | `qwen3_coder` | Excellent | Purpose-built for Cline. Best tool calling of any open model. |
-| 2x 48 GB GPUs (Meta) | Llama 4 Scout 4-bit, TP=2 | `llama4_pythonic` | Excellent | Meta flagship. Parallel tool calls. Heavy KV cache limits concurrency. |
-| 2x 48 GB GPUs (alt) | Qwen3.5-27B fp16, TP=2 | `hermes` | Very Good | Tiny KV cache. Best for high concurrency or parallel Cline sessions. |
-| 1x 16 GB GPU (home) | Qwen3.5-9B fp8 | `hermes` | Very Good | Latest gen, hybrid arch, punches above its weight on coding. |
-| 1x 16 GB GPU (Meta) | Llama 3.1-8B-Instruct-AWQ | `llama3_json` | Good | Solid Meta option. Use 16k context to manage KV cache. |
-| 1x 16 GB GPU (coding) | Qwen2.5-Coder-7B-Instruct-AWQ | `hermes` | Good | Dedicated coding model. Proven Cline compatibility. |
+| 2x 48 GB GPUs (concurrency) | Qwen3.5-27B fp16, TP=2 | `hermes` | Very Good | Tiny KV cache. Best for high concurrency or parallel Cline sessions. |
+| 2x 48 GB GPUs (Meta) | Llama 4 Scout 4-bit, TP=2 | `llama4_pythonic` | Excellent | Meta flagship. Parallel tool calls. Tight fit — heavy KV limits to 2 seqs. |
+| 1x 16 GB GPU (home) | Qwen2.5-Coder-7B-Instruct-AWQ | `hermes` | Good | Dedicated coding model. AWQ keeps weights tiny, 32k context with 4.5 GiB headroom. |
+| 1x 16 GB GPU (Meta) | Llama 3.1-8B-Instruct-AWQ | `llama3_json` | Good | Solid Meta option. Use 16k context — dense arch makes 32k KV too expensive. |
 | Quick test (any GPU) | Qwen2.5-Coder-1.5B-Instruct fp16 | `hermes` | Smoke test | Tiny footprint. Validates setup before big download. |
 
 ---
@@ -269,8 +264,8 @@ Notice the KV cache differences: Qwen3.5 models use only **2.0 GiB** at 32k cont
 Since sandboxLLM serves an **OpenAI-compatible API**, Cline can connect to it directly from another machine on the same LAN. Your GPU server runs the model; your workstation runs VS Code + Cline.
 
 ```
- ┌─────────────────────┐          LAN          ┌────────────────────────┐
- │   Workstation (PC)  │ ───── HTTP :7171 ────▸ │  GPU Server             │
+ ┌─────────────────────┐          LAN           ┌────────────────────────┐
+ │   Workstation (PC)  │ ───── HTTP :7171 ────▸ │  GPU Server            │
  │   VS Code + Cline   │                        │  sandboxLLM (Docker)   │
  └─────────────────────┘                        └────────────────────────┘
 ```
@@ -326,7 +321,7 @@ curl -H "Authorization: Bearer my-secret-key-change-me" http://192.168.1.50:7171
 |---|---|
 | **Base URL** | `http://192.168.1.50:7171/v1` |
 | **API Key** | `my-secret-key-change-me` |
-| **Model ID** | `Qwen/Qwen2.5-Coder-32B-Instruct` |
+| **Model ID** | `Qwen/Qwen3-Coder-30B-A3B-Instruct` |
 
    (Replace the IP, key, and model name with your actual values.)
 
@@ -380,7 +375,7 @@ DASHBOARD_PORT=9090 docker compose up --build
 
 ## Appendix A: Security Features
 
-sandboxLLM is designed to run on machines that handle sensitive code and data. The container is locked down in multiple layers:
+sandboxLLM is designed to run on machines that handle sensitive code and data. The security model focuses on **network isolation** — preventing the container from exfiltrating data — combined with privilege reduction:
 
 ### Network isolation
 
@@ -399,16 +394,6 @@ The container has **two phases** with different network postures:
 | `DO_NOT_TRACK=1` | Respects the standard do-not-track signal |
 
 The container can **receive** inbound connections on the published port (needed for Cline and the dashboard). After the first-run download, all outbound download/telemetry paths are disabled at the application level. For hard network-level blocking, see [Appendix B: Host Firewall](#appendix-b-host-firewall-optional).
-
-### Filesystem
-
-| Measure | Effect |
-|---|---|
-| `read_only: true` | Root filesystem is immutable — nothing can be written to the container image layers |
-| HF cache in named volume | Model weights persist across restarts but are isolated from the host filesystem |
-| `config.yaml` mounted `:ro` | Configuration cannot be tampered with at runtime |
-| `tmpfs /tmp` with `noexec` | Temp files allowed but **cannot be executed** |
-| `tmpfs /run` with `noexec` | Same for runtime directory |
 
 ### Privilege reduction
 
@@ -429,9 +414,8 @@ The container can **receive** inbound connections on the published port (needed 
 ### What this means in practice
 
 - During serving, the container **cannot upload your data** — offline mode blocks all HuggingFace/telemetry calls, and for hard guarantees use the host firewall (Appendix B).
-- The container **cannot modify your config** (`config.yaml` is read-only).
 - The container **cannot escalate privileges** to access the host beyond the explicitly mounted volumes.
-- The container **cannot execute arbitrary downloaded binaries** because the filesystem is read-only and tmpfs is `noexec`.
+- The container **cannot modify your config** (`config.yaml` is mounted read-only).
 
 ### LAN exposure and the API key
 

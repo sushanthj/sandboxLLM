@@ -8,8 +8,11 @@ LOG_FILE="${LOG_DIR}/vllm.log"
 # Ensure log directory exists (shared volume)
 mkdir -p "$LOG_DIR"
 
-# Tee all stdout/stderr to the log file AND the console
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Clear logs from previous run
+: > "$LOG_FILE"
+
+# Tee all stdout/stderr to the log file AND the console (unbuffered)
+exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
 
 echo "============================================================"
 echo "  sandboxLLM — Secure vLLM Entrypoint"
@@ -52,7 +55,7 @@ else
     echo "  Model '$MODEL' not in cache. Downloading..."
     echo "  (This is a one-time download — cached in a Docker volume for future runs)"
     echo ""
-    huggingface-cli download "$MODEL"
+    hf download "$MODEL"
     echo ""
     echo "  Download complete."
 fi
@@ -92,11 +95,9 @@ ARGS=(
 
 # Tensor parallel
 if [ "$TP" = "auto" ]; then
-    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    ARGS+=(--tensor-parallel-size "$NUM_GPUS")
-else
-    ARGS+=(--tensor-parallel-size "$TP")
+    TP=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 fi
+ARGS+=(--tensor-parallel-size "$TP")
 
 # Quantization
 if [ "$QUANT" != "none" ] && [ -n "$QUANT" ]; then
@@ -108,9 +109,9 @@ if [ -n "$API_KEY" ]; then
     ARGS+=(--api-key "$API_KEY")
 fi
 
-# Force KV cache on GPU
+# Force KV cache on GPU (disable CPU offloading)
 if [ "$KV_GPU_ONLY" = "True" ] || [ "$KV_GPU_ONLY" = "true" ]; then
-    ARGS+=(--swap-space 0)
+    ARGS+=(--cpu-offload-gb 0)
 fi
 
 # Tool/function calling (needed for Cline)
