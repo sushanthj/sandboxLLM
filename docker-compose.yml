@@ -1,0 +1,157 @@
+services:
+  # =====================================================================
+  # vLLM — LLM serving engine
+  # =====================================================================
+  vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # ---------- GPU access ----------
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # ---------- Networking ----------
+    # Bind to 0.0.0.0 so LAN clients (e.g. Cline on another PC) can connect.
+    # The entrypoint needs network briefly to download the model on first run.
+    # After download, it sets HF_HUB_OFFLINE=1 before launching vLLM.
+    # For full outbound blocking, see README Appendix B (host firewall).
+    ports:
+      - "${SANDBOXLLM_HOST:-0.0.0.0}:${SANDBOXLLM_PORT:-7171}:7171"
+    networks:
+      - internal
+
+    # ---------- Volumes ----------
+    volumes:
+      # Config (read-only)
+      - ./config.yaml:/workspace/config.yaml:ro
+
+      # HuggingFace cache — persistent Docker volume so models survive restarts.
+      # Downloaded automatically on first run
+      - hf-cache:/root/.cache/huggingface
+
+      # Shared log volume — preflight + vLLM logs readable by the dashboard
+      - vllm-logs:/var/log/sandboxllm
+
+    # ---------- Security hardening ----------
+
+    # Read-only root filesystem — nothing can be written to the container image.
+    read_only: true
+
+    # tmpfs mounts for the few directories that need writes at runtime.
+    tmpfs:
+      - /tmp:size=2G,noexec,nosuid,nodev
+      - /run:size=64M,noexec,nosuid,nodev
+
+    # Drop ALL Linux capabilities, then add back only what's needed.
+    cap_drop:
+      - ALL
+
+    # No new privileges (prevents setuid/setgid escalation).
+    security_opt:
+      - no-new-privileges:true
+
+    # Non-default seccomp profile would go here if you have one:
+    # - seccomp=seccomp-profile.json
+
+    # Prevent the container from gaining any additional privileges.
+    privileged: false
+
+    # Limit /proc visibility
+    pid: "host"  # needed for nvidia-smi; use "private" if not needed
+
+    # ---------- Resource limits ----------
+    # Set shared memory size (vLLM / PyTorch NCCL needs this for multi-GPU).
+    shm_size: "48gb"
+
+    # Prevent fork-bombs or runaway processes.
+    pids_limit: 512
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # ---------- Environment ----------
+    environment:
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+      # HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE are set by the entrypoint
+      # AFTER the model download phase — not here, so first-run download works.
+      - HF_HOME=/root/.cache/huggingface
+      - VLLM_USAGE_STATS_SERVER=   # Disable telemetry
+      - DO_NOT_TRACK=1
+
+    # ---------- Restart policy ----------
+    restart: unless-stopped
+
+  # =====================================================================
+  # Dashboard — lightweight monitoring UI
+  # =====================================================================
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+
+    ports:
+      - "${SANDBOXLLM_HOST:-0.0.0.0}:${DASHBOARD_PORT:-7172}:7172"
+
+    networks:
+      - internal
+
+    # GPU access for nvidia-smi queries (read-only, no compute needed)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount host /proc and /sys read-only for CPU/RAM/temp metrics
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - vllm-logs:/var/log/sandboxllm:ro
+
+    environment:
+      - VLLM_URL=http://vllm:7171
+      - DASHBOARD_PORT=7172
+
+    # Security: same hardening as vllm (minus the GPU-specific shm)
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    pids_limit: 64
+
+    depends_on:
+      - vllm
+
+    restart: unless-stopped
+
+# =====================================================================
+# Networks
+# =====================================================================
+# Shared bridge so dashboard can reach vLLM internally.
+# NOT marked "internal" — port publishing requires external connectivity.
+# Outbound is prevented at the container level (DNS black-hole + offline env).
+volumes:
+  hf-cache:
+    driver: local
+  vllm-logs:
+    driver: local
+
+networks:
+  internal:
+    driver: bridge

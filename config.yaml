@@ -1,0 +1,49 @@
+# =============================================================================
+# sandboxLLM Configuration
+# =============================================================================
+# Edit this file to configure your local LLM serving setup.
+# All VRAM estimation and validation happens automatically before serving.
+
+model:
+  # Hugging Face model name or local path (mounted into container)
+  name: "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+  # Quantization method. Options: none, awq, gptq, squeezellm, fp8
+  # Lower precision = less VRAM but slightly lower quality.
+  quantization: none
+
+  # Number of active parameters (in billions).
+  # For dense models this equals total params. For MoE models (e.g. Mixtral)
+  # set this to the number of *active* params per token (e.g. 12.9 for Mixtral 8x7B).
+  # Used for KV cache estimation. Set to null to auto-detect from model config.
+  active_params_billion: null
+
+serving:
+  # Maximum context length (tokens). Directly affects KV cache VRAM.
+  max_context_length: 32768
+
+  # Maximum number of concurrent sequences. Affects total KV cache allocation.
+  max_num_seqs: 64
+
+  # Port to expose the OpenAI-compatible API on the host.
+  port: 7171
+
+  # API key for authentication. Leave empty or remove to disable auth.
+  api_key: ""
+
+  # Tensor parallel degree — number of GPUs to shard the model across.
+  # Set to "auto" to use all available GPUs, or an integer (e.g. 2).
+  tensor_parallel: "auto"
+
+gpu:
+  # Maximum fraction of *each* GPU's VRAM that vLLM is allowed to use (0.0–1.0).
+  # The preflight check ensures model_weights + KV_cache fits within this budget.
+  max_utilization: 0.85
+
+  # Force all KV cache to reside on GPU (no CPU/disk offload).
+  # Recommended for agentic / latency-sensitive workloads.
+  kv_cache_gpu_only: true
+
+  # Override per-GPU VRAM in GiB for preflight estimation.
+  # Set to null to auto-detect at runtime via nvidia-smi.
+  vram_per_gpu_gib: null
