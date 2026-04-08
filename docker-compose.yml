@@ -112,6 +112,7 @@ services:
     environment:
       - VLLM_URL=http://vllm:7171
       - DASHBOARD_PORT=7172
+      - HOST_LAN_IP=${HOST_LAN_IP:-}
 
     # Security hardening
     cap_drop:

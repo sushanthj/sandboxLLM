@@ -38,13 +38,10 @@ VLLM_PORT = _CONFIG.get("serving", {}).get("port", 7171)
 
 
 def _lan_ip() -> str:
-    """Best-effort detection of the *host's* LAN IP.
+    """Return the host's LAN IP.
 
-    The dashboard runs inside a Docker container, so socket-based detection
-    returns the container's bridge IP.  Instead, we read the host's mounted
-    /host/proc to find the default-route interface, then look up its IP
-    from /host/proc/net/fib_trie (which lists LOCAL addresses per subnet).
-    Falls back to the HOST_LAN_IP env var if set.
+    Priority: HOST_LAN_IP env var > auto-detect from host's PID 1 network
+    namespace (accessible via bind-mounted /host/proc/1/net/route + fib_trie).
     """
     env_ip = os.environ.get("HOST_LAN_IP", "")
     if env_ip:
@@ -56,9 +53,9 @@ def _lan_ip() -> str:
         return ".".join(str(b) for b in struct.pack("<I", int(h, 16)))
 
     try:
-        # Step 1: find the default-route interface
+        # Find the default-route interface from the HOST's routing table
         default_iface = ""
-        with open("/host/proc/net/route") as f:
+        with open("/host/proc/1/net/route") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2 and parts[1] == "00000000":
@@ -67,39 +64,29 @@ def _lan_ip() -> str:
         if not default_iface:
             return ""
 
-        # Step 2: find the subnet for that interface from /proc/net/route
-        # (a route whose iface matches and has a non-zero destination)
-        iface_subnet_ip = ""
-        with open("/host/proc/net/route") as f:
-            next(f)  # skip header
+        # Find the subnet for that interface
+        with open("/host/proc/1/net/route") as f:
+            next(f)
             for line in f:
                 parts = line.split()
                 if (len(parts) >= 8 and parts[0] == default_iface
-                        and parts[1] != "00000000" and parts[7] != "FFFFFFFF"):
-                    iface_subnet_ip = _hex_to_ip(parts[1])
+                        and parts[1] != "00000000"):
+                    subnet_ip = _hex_to_ip(parts[1])
                     break
+            else:
+                return ""
 
-        # Step 3: find the LOCAL IP in that subnet from /proc/net/fib_trie
-        # fib_trie lists IPs as "|-- x.x.x.x" with "/32 host LOCAL" on the next line
-        if not iface_subnet_ip:
-            return ""
-
-        subnet_prefix = iface_subnet_ip.rsplit(".", 1)[0] + "."  # e.g. "192.168.1."
-
-        with open("/host/proc/net/fib_trie") as f:
+        # Find the LOCAL IP in that subnet from host's fib_trie
+        prefix = subnet_ip.rsplit(".", 1)[0] + "."
+        with open("/host/proc/1/net/fib_trie") as f:
             lines = f.readlines()
-
         for i, line in enumerate(lines):
             stripped = line.strip()
             if not (stripped.startswith("|--") or stripped.startswith("+--")):
                 continue
             ip_str = stripped.split()[-1]
-            if not ip_str.startswith(subnet_prefix):
-                continue
-            # Check that the next line marks it as LOCAL
-            if i + 1 < len(lines) and "/32 host LOCAL" in lines[i + 1]:
+            if ip_str.startswith(prefix) and i + 1 < len(lines) and "/32 host LOCAL" in lines[i + 1]:
                 return ip_str
-
         return ""
     except Exception:
         return ""
