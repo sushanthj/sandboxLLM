@@ -36,6 +36,74 @@ VLLM_API_KEY = _CONFIG.get("serving", {}).get("api_key", "") or ""
 VLLM_MODEL = _CONFIG.get("model", {}).get("name", "")
 VLLM_PORT = _CONFIG.get("serving", {}).get("port", 7171)
 
+
+def _lan_ip() -> str:
+    """Best-effort detection of the *host's* LAN IP.
+
+    The dashboard runs inside a Docker container, so socket-based detection
+    returns the container's bridge IP.  Instead, we read the host's mounted
+    /host/proc to find the default-route interface, then look up its IP
+    from /host/proc/net/fib_trie (which lists LOCAL addresses per subnet).
+    Falls back to the HOST_LAN_IP env var if set.
+    """
+    env_ip = os.environ.get("HOST_LAN_IP", "")
+    if env_ip:
+        return env_ip
+
+    import struct
+
+    def _hex_to_ip(h: str) -> str:
+        return ".".join(str(b) for b in struct.pack("<I", int(h, 16)))
+
+    try:
+        # Step 1: find the default-route interface
+        default_iface = ""
+        with open("/host/proc/net/route") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "00000000":
+                    default_iface = parts[0]
+                    break
+        if not default_iface:
+            return ""
+
+        # Step 2: find the subnet for that interface from /proc/net/route
+        # (a route whose iface matches and has a non-zero destination)
+        iface_subnet_ip = ""
+        with open("/host/proc/net/route") as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.split()
+                if (len(parts) >= 8 and parts[0] == default_iface
+                        and parts[1] != "00000000" and parts[7] != "FFFFFFFF"):
+                    iface_subnet_ip = _hex_to_ip(parts[1])
+                    break
+
+        # Step 3: find the LOCAL IP in that subnet from /proc/net/fib_trie
+        # fib_trie lists IPs as "|-- x.x.x.x" with "/32 host LOCAL" on the next line
+        if not iface_subnet_ip:
+            return ""
+
+        subnet_prefix = iface_subnet_ip.rsplit(".", 1)[0] + "."  # e.g. "192.168.1."
+
+        with open("/host/proc/net/fib_trie") as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not (stripped.startswith("|--") or stripped.startswith("+--")):
+                continue
+            ip_str = stripped.split()[-1]
+            if not ip_str.startswith(subnet_prefix):
+                continue
+            # Check that the next line marks it as LOCAL
+            if i + 1 < len(lines) and "/32 host LOCAL" in lines[i + 1]:
+                return ip_str
+
+        return ""
+    except Exception:
+        return ""
+
 # ---------------------------------------------------------------------------
 # Data collectors
 # ---------------------------------------------------------------------------
@@ -233,6 +301,7 @@ def api_connection():
         "model": VLLM_MODEL,
         "port": VLLM_PORT,
         "has_api_key": bool(VLLM_API_KEY),
+        "lan_ip": _lan_ip(),
     })
 
 
@@ -563,7 +632,7 @@ async function refreshConnection() {
     const resp = await fetch('/api/connection');
     if (!resp.ok) return;
     const d = await resp.json();
-    const host = window.location.hostname;
+    const host = d.lan_ip || window.location.hostname;
     const port = d.port || 7171;
     const baseUrl = `http://${host}:${port}/v1`;
     document.getElementById('conn-base-url').textContent = baseUrl;

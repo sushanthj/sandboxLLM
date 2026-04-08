@@ -119,6 +119,9 @@ if [ -n "$TOOL_PARSER" ] && [ "$TOOL_PARSER" != "none" ]; then
     ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 fi
 
+# Suppress per-request access logs (dashboard polls /v1/models every few seconds)
+ARGS+=(--no-enable-log-requests)
+
 echo "  Command: python -m vllm.entrypoints.openai.api_server ${ARGS[*]}"
 echo ""
 
