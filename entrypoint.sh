@@ -76,6 +76,7 @@ MAX_SEQS=$(yq serving.max_num_seqs)
 PORT=$(yq serving.port)
 API_KEY=$(yq serving.api_key)
 TP=$(yq serving.tensor_parallel)
+TOOL_PARSER=$(yq serving.tool_call_parser)
 MAX_UTIL=$(yq gpu.max_utilization)
 KV_GPU_ONLY=$(yq gpu.kv_cache_gpu_only)
 
@@ -110,6 +111,11 @@ fi
 # Force KV cache on GPU
 if [ "$KV_GPU_ONLY" = "True" ] || [ "$KV_GPU_ONLY" = "true" ]; then
     ARGS+=(--swap-space 0)
+fi
+
+# Tool/function calling (needed for Cline)
+if [ -n "$TOOL_PARSER" ] && [ "$TOOL_PARSER" != "none" ]; then
+    ARGS+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 fi
 
 echo "  Command: python -m vllm.entrypoints.openai.api_server ${ARGS[*]}"

@@ -35,6 +35,15 @@ serving:
   # Set to "auto" to use all available GPUs, or an integer (e.g. 2).
   tensor_parallel: "auto"
 
+  # Tool/function calling parser for the model. Required for Cline tool use.
+  # Options: none, hermes, qwen3_coder, llama4_pythonic, llama3_json
+  #   - "hermes"           — for Qwen2.5, Qwen3.5, Mistral, and most instruct models
+  #   - "qwen3_coder"      — for Qwen3-Coder family models
+  #   - "llama4_pythonic"   — for Llama 4 Scout / Maverick
+  #   - "llama3_json"       — for Llama 3.1 / 3.2 models
+  #   - "none"             — disable tool calling
+  tool_call_parser: "hermes"
+
 gpu:
   # Maximum fraction of *each* GPU's VRAM that vLLM is allowed to use (0.0–1.0).
   # The preflight check ensures model_weights + KV_cache fits within this budget.

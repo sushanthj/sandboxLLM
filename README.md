@@ -66,25 +66,50 @@ After startup:
 
 ## Configuration
 
-All settings live in a single **`config.yaml`**:
+All settings live in a single **`config.yaml`**. Here are two ready-to-use configs:
+
+**96 GB VRAM (2x 48 GB GPUs) — production/work:**
 
 ```yaml
 model:
-  name: "Qwen/Qwen2.5-Coder-32B-Instruct"
-  quantization: none            # none | awq | gptq | fp8 | squeezellm
-  active_params_billion: null   # null = auto-detect; set manually for MoE models
+  name: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  quantization: none
+  active_params_billion: null
 
 serving:
-  max_context_length: 32768     # max tokens per request
-  max_num_seqs: 64              # max concurrent sequences
-  port: 7171                    # container port for the API
-  api_key: ""                   # set a key to require authentication
-  tensor_parallel: "auto"       # "auto" = use all GPUs, or an integer
+  max_context_length: 32768
+  max_num_seqs: 4
+  port: 7171
+  api_key: "change-me-to-something-secret"
+  tensor_parallel: 2
+  tool_call_parser: "qwen3_coder"     # required for Qwen3-Coder function calling
 
 gpu:
-  max_utilization: 0.85         # fraction of VRAM vLLM may use (0.0–1.0)
-  kv_cache_gpu_only: true       # keep all KV cache on GPU (no CPU swap)
-  vram_per_gpu_gib: null        # null = auto-detect via nvidia-smi
+  max_utilization: 0.85
+  kv_cache_gpu_only: true
+  vram_per_gpu_gib: null
+```
+
+**16 GB VRAM (1x RTX 5080) — testing/home:**
+
+```yaml
+model:
+  name: "Qwen/Qwen3.5-9B"
+  quantization: fp8
+  active_params_billion: null
+
+serving:
+  max_context_length: 32768
+  max_num_seqs: 2
+  port: 7171
+  api_key: ""
+  tensor_parallel: 1
+  tool_call_parser: "hermes"
+
+gpu:
+  max_utilization: 0.85
+  kv_cache_gpu_only: true
+  vram_per_gpu_gib: null
 ```
 
 ### Key settings to adjust
@@ -92,11 +117,12 @@ gpu:
 | Setting | What it does | When to change |
 |---|---|---|
 | `model.name` | HuggingFace model ID or local path | Always — pick the model you want |
-| `model.quantization` | Weight precision | Use `awq`/`gptq` to fit larger models in less VRAM |
+| `model.quantization` | Weight precision | Use `awq`/`gptq`/`fp8` to fit larger models in less VRAM |
 | `serving.max_context_length` | Maximum tokens per sequence | Lower it to reduce KV cache VRAM; raise it for long-file edits |
 | `serving.max_num_seqs` | Concurrent requests | Lower if VRAM is tight; Cline typically sends 1–2 at a time |
 | `serving.api_key` | Authentication token | **Set this** if exposing on a LAN (see [Cline section](#using-with-cline-remote-pc)) |
 | `serving.tensor_parallel` | Number of GPUs to shard across | `"auto"` uses all GPUs; set to `1` to use a single GPU |
+| `serving.tool_call_parser` | Function calling format | `"qwen3_coder"` for Qwen3-Coder, `"hermes"` for Qwen2.5/most others, `"none"` to disable |
 | `gpu.max_utilization` | VRAM budget per GPU | 0.85 is conservative; push to 0.92 if you know your GPU's limits |
 
 ### Environment variable overrides
@@ -123,15 +149,40 @@ CUDA_VISIBLE_DEVICES=0,1 docker compose up --build
 
 Cline needs a model that excels at **instruction following**, **code generation**, **tool/function calling**, and **long-context reasoning**. The tables below show exact VRAM breakdowns so you can pick the right model for your hardware.
 
-### How to read the tables
+### Agentic suitability for Cline
+
+Not every model is equally suited for agentic coding. Cline relies heavily on **function/tool calling** (to read/write files, run commands, etc.) and **instruction following** (to execute multi-step plans). Here's how the model families compare:
+
+| Rating | Family | Why |
+|---|---|---|
+| **Excellent** | Qwen3-Coder | Purpose-built for agentic coding tools (Cline, Claude Code, Roo Code). Best-in-class tool calling. Trained specifically on agentic coding trajectories. |
+| **Excellent** | Llama 4 Scout/Maverick | Optimized for tool calling and agentic systems. Parallel tool calls supported. 10M context window. |
+| **Very Good** | Qwen3.5 (9B+) | Officially optimized for agentic coding via Cline. Strong tool calling, 262k context. The 9B model punches above many prior 13–30B models on reasoning/coding benchmarks. |
+| **Good** | Qwen2.5-Coder | Proven with Cline, dedicated coding model, reliable tool calling. Older generation but battle-tested. |
+| **Good** | Llama 3.1 8B | Decent tool calling (llama3_json parser), 128k context. Good for its size but not coding-specific. |
+| **Fair** | Llama 3.2 3B | Matches Llama 3.1 8B on tool use benchmarks (BFCL v2), but small size limits complex reasoning. |
+| **Fair** | Qwen3.5-4B / Qwen2.5-Coder-3B | Functional for simple edits. Struggle with complex multi-file refactors or long agentic chains. |
+| **Smoke test only** | Any 1.5B model | Too small for real agentic work. Fine for validating your setup. |
+
+### How to read the VRAM tables
 
 Every entry shows three numbers:
 
-- **Model Weights** — the raw size of the model parameters in VRAM (depends on precision).
-- **KV Cache** — the memory reserved for key/value attention cache at the given context length and concurrency. Formula: `2 × layers × kv_heads × head_dim × 2 bytes × context_len × max_num_seqs`.
+- **Model Weights** — the raw size of all model parameters in VRAM. For MoE models, *all* experts must be loaded even though only a few are active per token.
+- **KV Cache** — the memory reserved for key/value attention cache at the given context length and concurrency. Formula: `2 × attn_layers × kv_heads × head_dim × 2 bytes × context_len × max_num_seqs`. For hybrid models (Qwen3.5) that mix DeltaNet with standard attention, only the attention layers contribute KV cache — a significant saving.
 - **Total** — weights + KV cache. This must fit within `per_gpu_vram × num_gpus × max_utilization`.
 
 > All estimates assume fp16 KV cache (vLLM default). Actual usage includes ~1–2 GiB overhead for activations and CUDA kernels — the preflight script accounts for this via the utilization headroom.
+
+### Model generations at a glance
+
+| Family | Released | Strengths | Tool parser | Notes |
+|---|---|---|---|---|
+| **Qwen3-Coder** | 2025–2026 | Purpose-built for agentic coding (Cline, Claude Code). Best tool calling. | `qwen3_coder` | MoE — big total params, small active params. Requires vLLM >= 0.15. |
+| **Qwen3.5** | Mar 2026 | General-purpose with strong coding, 262k native context. | `hermes` | Hybrid architecture (DeltaNet + Attention) — very efficient KV cache. |
+| **Qwen2.5-Coder** | 2024–2025 | Proven, widely tested with Cline. Dedicated coding model. | `hermes` | Dense architecture. Stable and well-supported. |
+| **Llama 4 Scout** | Apr 2025 | Strong general-purpose + coding. 10M context. Parallel tool calls. | `llama4_pythonic` | MoE (109B total, 17B active). Large even quantized. |
+| **Llama 3.1/3.2** | 2024 | Solid general-purpose. 3.2-3B matches 3.1-8B on tool use. | `llama3_json` | Dense. Smaller sizes available for 16 GB GPUs. |
 
 ---
 
@@ -139,117 +190,77 @@ Every entry shows three numbers:
 
 These configurations are designed for a dual-GPU workstation (e.g. 2x RTX A6000, 2x L40S, 2x RTX 6000 Ada).
 
-| Model | Quant | Params | Weights | Ctx | Seqs | KV Cache | **Total** | Fits? |
-|---|---|---|---|---|---|---|---|---|
-| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 32.5B | 60.5 GiB | 32k | 4 | 16.0 GiB | **76.5 GiB** | **Yes** (5.1 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 32.5B | 60.5 GiB | 32k | 8 | 32.0 GiB | **92.5 GiB** | No (10.9 over) |
-| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 32.5B | 60.5 GiB | 16k | 8 | 16.0 GiB | **76.5 GiB** | **Yes** (5.1 GiB headroom) |
-| `mistralai/Codestral-22B-v0.1` | fp16 | 22.2B | 41.3 GiB | 32k | 8 | 16.0 GiB | **57.3 GiB** | **Yes** (24.3 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-14B-Instruct` | fp16 | 14.8B | 27.5 GiB | 32k | 8 | 14.0 GiB | **41.5 GiB** | **Yes** (40.1 GiB headroom) |
+| Model | Quant | Total Params | Weights | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
+|---|---|---|---|---|---|---|---|---|---|
+| **`Qwen/Qwen3-Coder-30B-A3B-Instruct`** | fp16 | 30.5B (3.3B active) | 56.8 GiB | 32k | 4 | 12.0 GiB | **68.8 GiB** | Excellent | **Yes** (12.8 GiB headroom) |
+| `Qwen/Qwen3-Coder-30B-A3B-Instruct` | fp16 | 30.5B | 56.8 GiB | 32k | 8 | 24.0 GiB | **80.8 GiB** | Excellent | **Yes** (0.8 GiB headroom) |
+| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | 4-bit | 109B (17B active) | 54.5 GiB | 32k | 2 | 20.0 GiB | **74.5 GiB** | Excellent | **Yes** (7.1 GiB headroom) |
+| `Qwen/Qwen2.5-Coder-32B-Instruct` | fp16 | 32.5B | 60.5 GiB | 32k | 4 | 16.0 GiB | **76.5 GiB** | Good | **Yes** (5.1 GiB headroom) |
+| `Qwen/Qwen3.5-27B` | fp16 | 27B | 50.3 GiB | 32k | 4 | 8.0 GiB | **58.3 GiB** | Very Good | **Yes** (23.3 GiB headroom) |
+| `Qwen/Qwen3.5-27B` | fp16 | 27B | 50.3 GiB | 32k | 12 | 24.0 GiB | **74.3 GiB** | Very Good | **Yes** (7.3 GiB headroom) |
 
 > **Architecture details used:**
-> - Qwen2.5-Coder-32B: 64 layers, 8 KV heads, head_dim 128
-> - Codestral-22B: 56 layers, 8 KV heads, head_dim 128
-> - Qwen2.5-Coder-14B: 48 layers, 8 KV heads, head_dim 128
+> - Qwen3-Coder-30B-A3B: 48 layers, 4 KV heads, head_dim 128, MoE (128 experts, 8 active)
+> - Llama 4 Scout: 80 layers, 8 KV heads, head_dim 128, MoE (16 experts, 2 active). 4-bit via `RedHatAI/Llama-4-Scout-17B-16E-Instruct-quantized.w4a16` or on-the-fly quantization.
+> - Qwen2.5-Coder-32B: 64 layers, 8 KV heads, head_dim 128, dense
+> - Qwen3.5-27B: 64 total layers but only 16 attention layers (hybrid DeltaNet), 4 KV heads, head_dim 256
 
-**Recommended config — Qwen 32B fp16 on 2x 48 GB GPUs:**
+**Recommended: Qwen3-Coder-30B-A3B** — purpose-built for agentic coding (Cline, Claude Code). Best tool calling of any open model. 12.8 GiB headroom at 32k. Set `tool_call_parser: "qwen3_coder"`.
 
-```yaml
-model:
-  name: "Qwen/Qwen2.5-Coder-32B-Instruct"
-  quantization: none
+**Meta alternative: Llama 4 Scout (4-bit)** — Meta's flagship open model. Excellent tool calling with parallel tool call support. 109B total params (17B active MoE) squeezed into 96 GB via 4-bit quantization. Limited to 2 concurrent seqs at 32k due to heavy KV cache (80 dense attention layers). Set `tool_call_parser: "llama4_pythonic"`.
 
-serving:
-  max_context_length: 32768
-  max_num_seqs: 4              # Cline sends 1-2 at a time; 4 gives headroom
-  port: 7171
-  api_key: "change-me"
-  tensor_parallel: 2
+**High-concurrency: Qwen3.5-27B** — hybrid architecture gives it the smallest KV cache in this table. You can run 12 concurrent seqs at 32k and still fit. Great for multi-user or parallel Cline sessions. Set `tool_call_parser: "hermes"`.
 
-gpu:
-  max_utilization: 0.85
-  kv_cache_gpu_only: true
-```
-
-**Alternative — if you want more concurrent sequences**, drop context to 16k:
-
-```yaml
-serving:
-  max_context_length: 16384
-  max_num_seqs: 8
-```
+**Proven fallback: Qwen2.5-Coder-32B** — battle-tested with Cline, dense architecture (simplest to deploy), but tighter on VRAM. Set `tool_call_parser: "hermes"`.
 
 ---
 
 ### Setup B: 1x 16 GB GPU (RTX 5080, 85% = 13.6 GiB budget)
 
-For testing on a single consumer GPU. Quality won't match the 32B models, but these are functional for validating the setup and simple coding tasks.
+For testing at home on a single consumer GPU. The Qwen3.5 hybrid architecture shines here — tiny KV cache means you can run a surprisingly capable 9B model in fp8, or a 4B model in full fp16, with 32k context.
 
-| Model | Quant | Params | Weights | Ctx | Seqs | KV Cache | **Total** | Fits? |
-|---|---|---|---|---|---|---|---|---|
-| `Qwen/Qwen2.5-Coder-7B-Instruct` | fp16 | 7.6B | 14.2 GiB | 32k | 2 | 3.5 GiB | **17.7 GiB** | No (4.1 over) |
-| `Qwen/Qwen2.5-Coder-7B-Instruct` | fp16 | 7.6B | 14.2 GiB | 8k | 2 | 0.9 GiB | **15.1 GiB** | No (1.5 over) |
-| `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | awq | 7.6B | 3.5 GiB | 32k | 2 | 3.5 GiB | **7.0 GiB** | **Yes** (6.6 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | awq | 7.6B | 3.5 GiB | 32k | 4 | 7.0 GiB | **10.5 GiB** | **Yes** (3.1 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-3B-Instruct` | fp16 | 3.1B | 5.8 GiB | 32k | 2 | 2.3 GiB | **8.1 GiB** | **Yes** (5.5 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-3B-Instruct` | fp16 | 3.1B | 5.8 GiB | 32k | 4 | 4.5 GiB | **10.3 GiB** | **Yes** (3.3 GiB headroom) |
-| `Qwen/Qwen2.5-Coder-1.5B-Instruct` | fp16 | 1.5B | 2.9 GiB | 32k | 4 | 1.8 GiB | **4.7 GiB** | **Yes** (8.9 GiB headroom) |
+| Model | Quant | Total Params | Weights | Ctx | Seqs | KV Cache | **Total** | Agentic | Fits? |
+|---|---|---|---|---|---|---|---|---|---|
+| **`Qwen/Qwen3.5-9B`** | fp8 | 9B | 8.4 GiB | 32k | 2 | 2.0 GiB | **10.4 GiB** | Very Good | **Yes** (3.2 GiB headroom) |
+| `Qwen/Qwen3.5-4B` | fp16 | 4B | 7.5 GiB | 32k | 2 | 2.0 GiB | **9.5 GiB** | Fair | **Yes** (4.1 GiB headroom) |
+| `Qwen/Qwen3.5-4B` | fp16 | 4B | 7.5 GiB | 32k | 4 | 4.0 GiB | **11.5 GiB** | Fair | **Yes** (2.1 GiB headroom) |
+| `Qwen/Qwen2.5-Coder-7B-Instruct-AWQ` | awq | 7.6B | 3.5 GiB | 32k | 2 | 3.5 GiB | **7.0 GiB** | Good | **Yes** (6.6 GiB headroom) |
+| `meta-llama/Llama-3.1-8B-Instruct-AWQ` | awq | 8B | 3.7 GiB | 16k | 2 | 4.0 GiB | **7.7 GiB** | Good | **Yes** (5.9 GiB headroom) |
+| `meta-llama/Llama-3.1-8B-Instruct-AWQ` | awq | 8B | 3.7 GiB | 32k | 2 | 8.0 GiB | **11.7 GiB** | Good | **Yes** (1.9 GiB headroom) |
+| `meta-llama/Llama-3.2-3B-Instruct` | fp16 | 3.2B | 6.0 GiB | 16k | 2 | 3.5 GiB | **9.5 GiB** | Fair | **Yes** (4.1 GiB headroom) |
+| `Qwen/Qwen2.5-Coder-1.5B-Instruct` | fp16 | 1.5B | 2.9 GiB | 32k | 4 | 1.8 GiB | **4.7 GiB** | Smoke test | **Yes** (8.9 GiB headroom) |
 
 > **Architecture details used:**
-> - Qwen2.5-Coder-7B: 28 layers, 4 KV heads, head_dim 128
-> - Qwen2.5-Coder-3B: 36 layers, 2 KV heads, head_dim 128
-> - Qwen2.5-Coder-1.5B: 28 layers, 2 KV heads, head_dim 64
+> - Qwen3.5-9B: 32 total layers, **8 attention layers** (hybrid DeltaNet), 4 KV heads, head_dim 256
+> - Qwen3.5-4B: 32 total layers, **8 attention layers** (hybrid DeltaNet), 4 KV heads, head_dim 256
+> - Qwen2.5-Coder-7B: 28 layers (all attention), 4 KV heads, head_dim 128
+> - Llama 3.1-8B: 32 layers (all attention), 8 KV heads, head_dim 128. Note: heavy KV cache (8 KV heads, all layers)
+> - Llama 3.2-3B: 28 layers (all attention), 8 KV heads, head_dim 128. Same KV head count as the 8B!
+> - Qwen2.5-Coder-1.5B: 28 layers (all attention), 2 KV heads, head_dim 64
 
-**Recommended config — Qwen 7B AWQ on RTX 5080 (testing):**
+Notice the KV cache differences: Qwen3.5 models use only **2.0 GiB** at 32k context (8 attention layers out of 32), while the similarly-sized Llama 3.1-8B needs **8.0 GiB** (all 32 layers, 8 KV heads). The hybrid DeltaNet architecture is a game-changer for VRAM-constrained setups.
 
-```yaml
-model:
-  name: "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
-  quantization: awq
+**Recommended: Qwen3.5-9B (fp8)** — latest generation, 9B params with only 2 GiB KV cache at 32k. The 9B model punches above many prior 13–30B models on reasoning/coding benchmarks. Officially optimized for Cline. Set `tool_call_parser: "hermes"`.
 
-serving:
-  max_context_length: 32768
-  max_num_seqs: 2
-  port: 7171
-  api_key: ""
-  tensor_parallel: 1
+**Meta alternative: Llama 3.1-8B-Instruct-AWQ** — Meta's best option for 16 GB. Solid tool calling and 128k native context. However, the dense architecture with 8 KV heads means KV cache is expensive — use 16k context to keep headroom. Set `tool_call_parser: "llama3_json"`.
 
-gpu:
-  max_utilization: 0.85
-  kv_cache_gpu_only: true
-```
+**Coding-specific: Qwen2.5-Coder-7B-AWQ** — dedicated coding model, proven with Cline. Smallest total footprint (7.0 GiB) thanks to aggressive AWQ quantization. Set `tool_call_parser: "hermes"`.
 
-**Tiny model for quick smoke-testing:**
-
-```yaml
-model:
-  name: "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-  quantization: none
-
-serving:
-  max_context_length: 32768
-  max_num_seqs: 4
-  port: 7171
-  api_key: ""
-  tensor_parallel: 1
-
-gpu:
-  max_utilization: 0.85
-  kv_cache_gpu_only: true
-```
-
-This loads in under 5 GiB and is useful for testing the Docker pipeline, networking, and Cline connectivity end-to-end before switching to a heavier model.
+**Smoke test: Qwen2.5-Coder-1.5B** — loads in under 5 GiB. Too small for real agentic work, but validates Docker, networking, and Cline connectivity end-to-end.
 
 ---
 
 ### Which to pick?
 
-| Your hardware | Best model | Why |
-|---|---|---|
-| 2x 48 GB GPUs (work) | Qwen2.5-Coder-32B fp16, TP=2 | Best coding quality available at this size. Full precision, no quality loss. |
-| 1x 24 GB GPU | Qwen2.5-Coder-32B-Instruct-AWQ | 4-bit quantization with minimal quality loss. |
-| 1x 16 GB GPU (home) | Qwen2.5-Coder-7B-Instruct-AWQ | Best quality that fits. Good for single-file edits. |
-| Quick test (any GPU) | Qwen2.5-Coder-1.5B-Instruct fp16 | Loads fast, tiny footprint. Validate your setup before committing to a big download. |
+| Your hardware | Best model | Tool parser | Agentic | Why |
+|---|---|---|---|---|
+| 2x 48 GB GPUs (work) | Qwen3-Coder-30B-A3B fp16, TP=2 | `qwen3_coder` | Excellent | Purpose-built for Cline. Best tool calling of any open model. |
+| 2x 48 GB GPUs (Meta) | Llama 4 Scout 4-bit, TP=2 | `llama4_pythonic` | Excellent | Meta flagship. Parallel tool calls. Heavy KV cache limits concurrency. |
+| 2x 48 GB GPUs (alt) | Qwen3.5-27B fp16, TP=2 | `hermes` | Very Good | Tiny KV cache. Best for high concurrency or parallel Cline sessions. |
+| 1x 16 GB GPU (home) | Qwen3.5-9B fp8 | `hermes` | Very Good | Latest gen, hybrid arch, punches above its weight on coding. |
+| 1x 16 GB GPU (Meta) | Llama 3.1-8B-Instruct-AWQ | `llama3_json` | Good | Solid Meta option. Use 16k context to manage KV cache. |
+| 1x 16 GB GPU (coding) | Qwen2.5-Coder-7B-Instruct-AWQ | `hermes` | Good | Dedicated coding model. Proven Cline compatibility. |
+| Quick test (any GPU) | Qwen2.5-Coder-1.5B-Instruct fp16 | `hermes` | Smoke test | Tiny footprint. Validates setup before big download. |
 
 ---
 
