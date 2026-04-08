@@ -455,7 +455,7 @@ function renderGPUs(gpus) {
       </div>
       <div class="metric">
         <span class="metric-label">VRAM</span>
-        <div class="val-group"><span class="metric-value">${fmt(g.mem_used_mib,'M')} / ${fmt(g.mem_total_mib,'M')}</span>${bar(g.mem_util_pct)}</div>
+        <div class="val-group"><span class="metric-value">${fmt(g.mem_used_mib,'M')} / ${fmt(g.mem_total_mib,'M')}</span>${bar(g.mem_total_mib ? Math.round(g.mem_used_mib / g.mem_total_mib * 100) : 0)}</div>
       </div>
       <div class="metric">
         <span class="metric-label">Temperature</span>
